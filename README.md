@@ -18,15 +18,17 @@ TensorRT for Deformable Detr(use python)
 
 ### 2.Genrate TensorRT engine
 
-    polygraphy convert deformable_detr.onnx --fp16 --workspace 8G -o deformable_detr_fp16.engine
+    polygraphy convert deformable_detr.onnx --workspace 8G -o deformable_detr_fp32.engine
 
 ### 3.Inference
 
-    python3 demo.py --engine deformable_detr_fp16.engine --thresh 0.3 --img ${your_picture_path} --output result.jpg
+    python3 demo.py --engine deformable_detr_fp32.engine --thresh 0.3 --img ${your_picture_path} --output result.jpg
 
 ## Inference performance(only inference time in GPU)
 
 GPU|Model|Mode|Inference time
 :--: | :--: | :--: | :--: |
-3090| deformable_detr_twostage_refine_r50_16x2_50e_coco | fp32 | 35ms
+3090 | deformable_detr_twostage_refine_r50_16x2_50e_coco | fp32 | 35ms
 3090 | deformable_detr_twostage_refine_r50_16x2_50e_coco | fp16 | 17ms
+
+<img src="./data/result.jpg" width="500px"></img>
