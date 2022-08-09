@@ -31,4 +31,4 @@ GPU|Model|Mode|Inference time
 3090 | deformable_detr_twostage_refine_r50_16x2_50e_coco | fp32 | 35ms
 3090 | deformable_detr_twostage_refine_r50_16x2_50e_coco | fp16 | 17ms
 
-<img src="./data/result.jpg" width="500px"></img>
+<center><img src="./data/result.jpg" width="500px"></img></center>
