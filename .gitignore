@@ -1,5 +1,4 @@
 .vscode
 *.onnx
 *.pth
-*.jpg
 build
