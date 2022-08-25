@@ -5,10 +5,10 @@
 
 TensorRT for Deformable Detr(use python)
 ## Test enviroments
-    TensorRT = 8.4
+    TensorRT 8.4.1.5
     Ubuntu 18.04
-    mmdetection
-    polygraphy
+    mmdetection 2.24.1
+    polygraphy(TensorRT Tool)
 
 ## A quick demo
 

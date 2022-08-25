@@ -118,18 +118,20 @@ class TRTDeformDetr(nn.Module):
         num_img = x.shape[0]
         assert num_img==1, "now only support one img input"
 
-        bindings = [None] * (1+2)
+        bindings = [None] * self.engine.num_bindings 
         bindings[0] = x.contiguous().data_ptr()
 
         outputs = [None] * 2
 
+        output_index = {"bbox":1,"cls":0}
         for i in range(1,3):
+            output_name = self.engine.get_binding_name(i)
             output_shape = tuple(self.context.get_binding_shape(i))
             dtype = torch_dtype_from_trt(self.engine.get_binding_dtype(i))
             device = torch_device_from_trt(self.engine.get_location(i))
 
             output = torch.empty(size=output_shape,dtype=dtype,device=device)
-            outputs[i-1] = output
+            outputs[output_index[output_name]] = output
             bindings[i] = output.data_ptr()
         
         self.context.execute_async_v2(bindings,
@@ -138,7 +140,6 @@ class TRTDeformDetr(nn.Module):
         cls_scores = outputs[0].sigmoid()
         num_classes = cls_scores.shape[-1]
         bbox_preds = outputs[1]
-
 
         cls_score = cls_scores[0]
         cls_score_per_img, top_indices = cls_score.flatten(0,1).topk(self.max_per_img,sorted=True)

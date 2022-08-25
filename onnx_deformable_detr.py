@@ -144,18 +144,9 @@ def deformable_detr_head_onnx_export(self, mlvl_feats):
         )
     hs = hs.permute(1,0,2)
     lvl = 5
-    reference = inter_references#[lvl - 1]
-    reference = inverse_sigmoid(reference)
     outputs_class = self.cls_branches[lvl](hs)
-    tmp = self.reg_branches[lvl](hs)
-    if reference.shape[-1] == 4:
-        tmp += reference
-    else:
-        assert reference.shape[-1] == 2
-        tmp[..., :2] += reference
-    outputs_coord = tmp.sigmoid()
- 
-    return outputs_class, outputs_coord
+
+    return outputs_class, inter_references
 
 
 def deformable_detr_transformer_gen_encoder_output_proposals(self, memory, memory_padding_mask,
@@ -408,6 +399,7 @@ if __name__=="__main__":
     x = torch.randn(1,3,opt.h,opt.w)#.cuda()
 
     torch.onnx.export(model,x,opt.output,verbose=True,
+                output_names=["cls","bbox"],
                 enable_onnx_checker=False,
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
                 opset_version=opsetversion,
