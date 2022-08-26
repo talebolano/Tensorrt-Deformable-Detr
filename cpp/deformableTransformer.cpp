@@ -104,7 +104,6 @@ int temperature = 10000
         }
     }
     Weights pos_embed_weight{ DataType::kFLOAT, pval, h * w * num_pos_feats * 2 };
-    weightMap["pos"] = pos_embed_weight;
     auto pos_embed = network->addConstant(Dims3{ 1,h * w, num_pos_feats * 2 }, pos_embed_weight);
     assert(pos_embed);
     return pos_embed->getOutput(0);
@@ -475,11 +474,17 @@ ITensor* MultiScaleDeformHeadAttention(
             reference_point_shuffle->setName((lname+".reference_point_shuffle").c_str());
             reference_point_shuffle->setReshapeDimensions(Dims{6,{batch_size,tgt_len,1,num_level,1,point_size}});
 
-            auto reference_point_cxcy = network->addSlice(*reference_point_shuffle->getOutput(0),
-                                Dims{6,{0,0,0,0,0,0}},Dims{6,{1,1,1,1,1,2}},Dims{6,{1,1,1,1,1,1}});
+            auto reference_point_cxcy = network->addSlice(
+                                *reference_point_shuffle->getOutput(0),
+                                Dims{6,{0,0,0,0,0,0}},
+                                Dims{6,{batch_size,tgt_len,1,num_level,1,2}},
+                                Dims{6,{1,1,1,1,1,1}});
 
-            auto reference_point_wh = network->addSlice(*reference_point_shuffle->getOutput(0),
-                                Dims{6,{0,0,0,0,0,2}},Dims{6,{1,1,1,1,1,2}},Dims{6,{1,1,1,1,1,1}});
+            auto reference_point_wh = network->addSlice(
+                                *reference_point_shuffle->getOutput(0),
+                                Dims{6,{0,0,0,0,0,2}},
+                                Dims{6,{batch_size,tgt_len,1,num_level,1,2}},
+                                Dims{6,{1,1,1,1,1,1}});
 
             
             auto sampling_offset_num_points = network->addConstant(Dims{6,{1,1,1,1,1,1}},Weights{DataType::kFLOAT, &num_point, 1});
@@ -846,12 +851,11 @@ ITensor** TransformerDecoder(
 ITensor* EncoderReferencePoints(
     INetworkDefinition *network,
     const std::string& lname,
-    std::vector<std::vector<int>> spatial_shapes, // num_level,2
-    int num_level = 4
+    std::vector<std::vector<int>> spatial_shapes // num_level,2
 ){
     // 返回固定值的reference point shape (bs, num_keys, num_levels, 2).
     int reference_points_size = 0;
-    for(int i=0;i<num_level;++i){
+    for(int i=0;i<spatial_shapes.size();++i){
         auto spatial_shape = spatial_shapes[i];    
         int h = spatial_shape[0];
         int w = spatial_shape[1];
@@ -862,7 +866,7 @@ ITensor* EncoderReferencePoints(
 
     float *reference_points = reinterpret_cast<float*>(malloc(sizeof(float) * reference_points_size * 2));// hxw+hxw+hxw,2
 
-    for(int i=0;i<num_level;++i){
+    for(int i=0;i<spatial_shapes.size();++i){
         auto spatial_shape = spatial_shapes[i];    
         int h = spatial_shape[0];
         int w = spatial_shape[1];
@@ -882,7 +886,7 @@ ITensor* EncoderReferencePoints(
                     Dims4{1,reference_points_size,1,2},reference_points_weight);
 
 
-    auto valid_ratios = network->addConstant(Dims4{1,1,num_level,1},Weights{DataType::kFLOAT,&SCALING_ONE,1});
+    auto valid_ratios = network->addConstant(Dims4{1,1,spatial_shapes.size(),1},Weights{DataType::kFLOAT,&SCALING_ONE,1});
 
     auto reference_points_num_level = network->addElementWise(
         *reference_points_constant->getOutput(0),
@@ -891,6 +895,146 @@ ITensor* EncoderReferencePoints(
     );
 
     return reference_points_num_level->getOutput(0);
+}
+
+
+ITensor** GenEncoderOutputProposals(
+    INetworkDefinition *network,
+    std::unordered_map<std::string, Weights>& weightMap,
+    const std::string& lname,
+    ITensor &memory, //(bs, num_key, embed_dim) 
+    std::vector<std::vector<int>> spatial_shapes,
+    int d_model = 256
+){
+    // 返回固定值的reference point shape (bs, num_keys, 4).
+    int reference_points_size = 0;
+    for(int i=0;i<spatial_shapes.size();++i){
+        auto spatial_shape = spatial_shapes[i];    
+        int h = spatial_shape[0];
+        int w = spatial_shape[1];
+
+        reference_points_size+=h*w;
+
+    }
+
+    float *reference_points = reinterpret_cast<float*>(malloc(sizeof(float) * reference_points_size * 2));// hxw+hxw+hxw,4
+
+    for(int i=0;i<spatial_shapes.size();++i){
+        auto spatial_shape = spatial_shapes[i];    
+        int h = spatial_shape[0];
+        int w = spatial_shape[1];
+
+        for(int y=0;y<h;++y){
+            for(int x=0;x<w;++x){
+                reference_points[4*x + 4*y*w + 4*i*h*w] = (0.5 + x)/(float)w;
+                reference_points[4*x + 1 + 4*y*w + 4*i*h*w] = (0.5 + y)/(float)h;
+                reference_points[4*x + 2 + 4*y*w + 4*i*h*w] = 0.05*pow(2.,(float)i);
+                reference_points[4*x + 3 + 4*y*w + 4*i*h*w] = 0.05*pow(2.,(float)i);
+            }
+        }
+
+    }
+
+    Weights reference_points_weight{DataType::kFLOAT,reference_points,reference_points_size * 4};   
+
+    auto output_proposal = network->addConstant(
+                    Dims3{1,reference_points_size,4},reference_points_weight);
+
+    ITensor* output_proposal_inverse_sigmoid = InverseSigmoid(network,lname+".inverse_sigmoid",*output_proposal->getOutput(0));
+
+    // output memory
+    auto enc_output_weight = network->addConstant(Dims3{1,d_model,d_model},
+                            weightMap[lname+".weight"]);
+
+    auto enc_output_mul = network->addMatrixMultiply(
+                            memory,
+                            MatrixKNONE,
+                            *enc_output_weight->getOutput(0),
+                            MatrixKNONE
+                            );
+
+    auto enc_output_bias = network->addConstant(Dims3{1,1,d_model},weightMap[lname+",bias"]);
+
+    auto enc_output_add = network->addElementWise(
+                            *enc_output_mul->getOutput(0),
+                            *enc_output_bias->getOutput(0),
+                            ElementWiseOperation::kSUM
+                        );
+
+    ITensor* outputs[] = {enc_output_add->getOutput(0),output_proposal_inverse_sigmoid};
+
+    return outputs;
+}
+
+
+ITensor* ProPosalPosEmbed(
+    INetworkDefinition* network,
+    const std::string& lname,
+    ITensor& output_proposal,  // B,nq,4 sigmoid
+    int num_pos_feats = 128,
+    int temperature = 10000
+){
+
+    int batch_size = output_proposal.getDimensions().d[0];
+    int tgt_len = output_proposal.getDimensions().d[1];
+
+    float *dim_t = reinterpret_cast<float*>(malloc(sizeof(float) * num_pos_feats));// 128
+
+    for(int i=0;i<num_pos_feats;++i){
+        dim_t[i] = 2.*3.1415926 / pow((float)temperature, (float)(2.*(i/2) / (float)num_pos_feats));
+    }
+
+    auto dim = network->addConstant(Dims4{1,1,1,num_pos_feats},Weights{DataType::kFLOAT,&dim_t,num_pos_feats});
+
+    auto proposals_shuffle = network->addShuffle(output_proposal);
+    proposals_shuffle->setName((lname+".shuffle").c_str());
+    proposals_shuffle->setReshapeDimensions(Dims4{batch_size,tgt_len,4,1});
+
+    auto pos = network->addElementWise(
+                    *proposals_shuffle->getOutput(0),
+                    *dim->getOutput(0),
+                    ElementWiseOperation::kPROD); //b,nq,4,128
+
+    auto pos_cxw = network->addSlice(
+                    *pos->getOutput(0),
+                    Dims4{0,0,0,0},
+                    Dims4{batch_size,tgt_len,4,num_pos_feats/2},
+                    Dims4{1,1,1,2}); //b,nq,4,64
+
+    auto pos_cyh = network->addSlice(
+                    *pos->getOutput(0),
+                    Dims4{0,0,0,1},
+                    Dims4{batch_size,tgt_len,4,num_pos_feats/2},
+                    Dims4{1,1,1,2}); //b,nq,4,64
+
+    auto pos_cxw_sin = network->addUnary(
+                    *pos_cxw->getOutput(0),
+                    UnaryOperation::kSIN);
+
+    auto pos_cxw_cos = network->addUnary(
+                    *pos_cyh->getOutput(0),
+                    UnaryOperation::kCOS);
+
+    ITensor * pos_cxwcyh[] = {pos_cxw_sin->getOutput(0),pos_cxw_cos->getOutput(0)};
+    auto pos_cat = network->addConcatenation(
+                        pos_cxwcyh,
+                        2);
+    pos_cat->setAxis(3);
+    auto pos_shuffle = network->addShuffle(*pos_cat->getOutput(0));
+    pos_shuffle->setName((lname+".pos_shuffle").c_str());
+    pos_shuffle->setReshapeDimensions(Dims3{batch_size,tgt_len,4*num_pos_feats});
+
+    return pos_shuffle->getOutput(0);
+
+}
+
+ITensor** Transformer(
+    INetworkDefinition *network,
+    std::unordered_map<std::string, Weights>& weightMap,
+    const std::string& lname,
+    ITensor& mlvl_feats // 
+){
+    
 }
 
 
