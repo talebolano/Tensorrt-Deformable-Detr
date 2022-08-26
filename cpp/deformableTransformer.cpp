@@ -104,7 +104,7 @@ int temperature = 10000
         }
     }
     Weights pos_embed_weight{ DataType::kFLOAT, pval, h * w * num_pos_feats * 2 };
-    auto pos_embed = network->addConstant(Dims3{ 1,h * w, num_pos_feats * 2 }, pos_embed_weight);
+    auto pos_embed = network->addConstant(Dims3{ 1, h * w, num_pos_feats * 2 }, pos_embed_weight);
     assert(pos_embed);
     return pos_embed->getOutput(0);
 }
@@ -851,7 +851,7 @@ ITensor** TransformerDecoder(
 ITensor* EncoderReferencePoints(
     INetworkDefinition *network,
     const std::string& lname,
-    std::vector<std::vector<int>> spatial_shapes // num_level,2
+    const std::vector<std::vector<int>> spatial_shapes // num_level,2
 ){
     // 返回固定值的reference point shape (bs, num_keys, num_levels, 2).
     int reference_points_size = 0;
@@ -944,7 +944,7 @@ ITensor** GenEncoderOutputProposals(
 
     // output memory
     auto enc_output_weight = network->addConstant(Dims3{1,d_model,d_model},
-                            weightMap[lname+".weight"]);
+                            weightMap[lname+".enc_output.weight"]);
 
     auto enc_output_mul = network->addMatrixMultiply(
                             memory,
@@ -953,7 +953,7 @@ ITensor** GenEncoderOutputProposals(
                             MatrixKNONE
                             );
 
-    auto enc_output_bias = network->addConstant(Dims3{1,1,d_model},weightMap[lname+",bias"]);
+    auto enc_output_bias = network->addConstant(Dims3{1,1,d_model},weightMap[lname+".enc_output.bias"]);
 
     auto enc_output_add = network->addElementWise(
                             *enc_output_mul->getOutput(0),
@@ -961,7 +961,11 @@ ITensor** GenEncoderOutputProposals(
                             ElementWiseOperation::kSUM
                         );
 
-    ITensor* outputs[] = {enc_output_add->getOutput(0),output_proposal_inverse_sigmoid};
+    ITensor* enc_output_norm = LayerNorm(network,
+                            *enc_output_add->getOutput(0),
+                            weightMap,
+                            lname+".enc_output_norm",256);
+    ITensor* outputs[] = {enc_output_norm,output_proposal_inverse_sigmoid};
 
     return outputs;
 }
@@ -1028,17 +1032,171 @@ ITensor* ProPosalPosEmbed(
 
 }
 
+
 ITensor** Transformer(
     INetworkDefinition *network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
-    ITensor& mlvl_feats // 
+    ITensor** mlvl_feats, // b,c,h,w
+    ITensor** mlvl_pos_embeds, // 1,hw,c
+    int num_level=4,
+    int num_query=300,
+    int embed_dim=256,
+    int num_classes=80
 ){
+    //get spatial_shapes
+    //get level_start_index
+    int batch_size = mlvl_feats[0]->getDimensions().d[0];
+
+    int *spatial_shapes = reinterpret_cast<int*>(malloc(sizeof(int) * num_level * 2));
+    int *level_start_indexs = reinterpret_cast<int*>(malloc(sizeof(int) * num_level));
+
+    std::vector<std::vector<int>> spatial_shapes_vector(num_level);
+    ITensor* mlvl_feats_flattens[num_level];
+    ITensor* mlvl_pos_embed_flattens[num_level];
+
+    int num_hw = 0;
+    for(int i=0;i<num_level;++i){
+        std::vector<int> temp(2);
+
+        int b = mlvl_feats[i]->getDimensions().d[0];
+        int c = mlvl_feats[i]->getDimensions().d[1];
+        int h = mlvl_feats[i]->getDimensions().d[2];
+        int w = mlvl_feats[i]->getDimensions().d[3];
+        auto mlvl_feats_flatten = network->addShuffle(*mlvl_feats[i]);
+        mlvl_feats_flatten->setName((lname+".flatten."+std::to_string(i)).c_str());
+        mlvl_feats_flatten->setReshapeDimensions(Dims3{b,c,h*w});
+        mlvl_feats_flatten->setSecondTranspose(Permutation{2,0,1});
+        mlvl_feats_flattens[i] = mlvl_feats_flatten->getOutput(0);
+
+        auto level_embed = network->addConstant(Dims3{1,1,embed_dim},
+                                weightMap[lname+".level_embeds."+std::to_string(i)]);
+
+        auto lvl_pos_embed = network->addElementWise(
+                    *mlvl_pos_embeds[i],
+                    *level_embed->getOutput(0),
+                    ElementWiseOperation::kSUM);
+        mlvl_pos_embed_flattens[i] = lvl_pos_embed->getOutput(0);
+        
+        level_start_indexs[i] = num_hw;        
+        spatial_shapes[2*i] = h;
+        spatial_shapes[2*i+1] = w;
+        temp[0] = h;
+        temp[1] = w;
+
+        spatial_shapes_vector.push_back(temp);
+
+        num_hw += h * w;
+    }
+
+    auto feats_flattens = network->addConcatenation(
+                                mlvl_feats_flattens,
+                                num_level);
+    feats_flattens->setAxis(1); // HW,bs,c
+
+    auto pos_embed_flattens = network->addConcatenation(
+                                mlvl_pos_embed_flattens,
+                                num_level);
+    pos_embed_flattens->setAxis(1);// HW,1,c
+
+    auto spatial_shapes_tensor = network->addConstant(Dims2{num_level,2},
+                                            Weights{DataType::kINT32,&spatial_shapes,num_level*2});
+    auto level_start_indexs_tensor = network->addConstant(Dims{1,{num_level}},
+                                            Weights{DataType::kINT32,&level_start_indexs,num_level});
+
+
+    ITensor* encoder_reference_points = EncoderReferencePoints(network,lname,spatial_shapes_vector);
+
+
+    ITensor* memory = TransformerEncoder(network,weightMap,lname+".encoder",
+                                            *feats_flattens->getOutput(0),
+                                            *pos_embed_flattens->getOutput(0),
+                                            *encoder_reference_points,
+                                            *spatial_shapes_tensor->getOutput(0),
+                                            *level_start_indexs_tensor->getOutput(0),
+                                            6);
+
+    auto memory_shuffle = network->addShuffle(*memory);
+    memory_shuffle->setName((lname+".memory_shuffle").c_str());
+    memory_shuffle->setFirstTranspose(Permutation{1,0,2});
+
+    ITensor** output_memory_and_proposal;
+
+    output_memory_and_proposal = GenEncoderOutputProposals(network,weightMap,lname,*memory_shuffle->getOutput(0),spatial_shapes_vector,embed_dim);
+
+    ITensor* enc_outputs_class = ClsRegBranch(network,weightMap,"bbox_head.cls_branches.6",*output_memory_and_proposal[0],embed_dim,num_classes);
+
+    ITensor* enc_outputs_coord_unact_delta = ClsRegBranch(network,weightMap,"bbox_head.reg_branches.6",*output_memory_and_proposal[0],embed_dim,4);
     
+    auto enc_outputs_coord_unact = network->addElementWise(*output_memory_and_proposal[1],
+                                                            *enc_outputs_coord_unact_delta,
+                                                            ElementWiseOperation::kSUM);
+    
+    auto enc_outputs_class_one = network->addSlice(*enc_outputs_class,Dims3{0,0,0},Dims3{batch_size,num_hw,1},Dims3{1,1,1});
+
+    auto topk_proposals = network->addTopK(*enc_outputs_class_one->getOutput(0),TopKOperation::kMAX,num_query,1); // bs,300,1
+    // TODO: 重点检查，可能出错
+    auto topk_coords_unact = network->addGatherV2(*enc_outputs_coord_unact->getOutput(0),*topk_proposals->getOutput(1),GatherMode::kELEMENT); //// bs,300,4
+
+    auto decoder_reference_points = network->addActivation(*topk_coords_unact->getOutput(0),ActivationType::kSIGMOID);
+
+    ITensor* pos_trans_out = ProPosalPosEmbed(network,lname,*decoder_reference_points->getOutput(0));//bs,300,512
+
+
+    auto pos_trans_out_weight = network->addConstant(Dims3{1,2*embed_dim,2*embed_dim},
+                            weightMap[lname+".pos_trans.weight"]);
+
+    auto ops_trans_out_mul = network->addMatrixMultiply(
+                            *pos_trans_out,
+                            MatrixKNONE,
+                            *pos_trans_out_weight->getOutput(0),
+                            MatrixKNONE
+                            );
+
+    auto pos_trans_out_bias = network->addConstant(Dims3{1,1,2*embed_dim},weightMap[lname+".pos_trans.bias"]);
+
+    auto pos_trans_out_add = network->addElementWise(
+                            *ops_trans_out_mul->getOutput(0),
+                            *pos_trans_out_bias->getOutput(0),
+                            ElementWiseOperation::kSUM
+                        );
+
+    ITensor* pos_trans_out_add_norm = LayerNorm(network,
+                            *pos_trans_out_add->getOutput(0),
+                            weightMap,
+                            lname+".pos_trans_norm",2*embed_dim); // bs,300,512
+
+    auto pos_trans_out_shuffle = network->addShuffle(*pos_trans_out_add_norm);
+    pos_trans_out_shuffle->setName((lname+".pos_trans_out_shuffle").c_str());
+    pos_trans_out_shuffle->setFirstTranspose(Permutation{1,0,2}); // 300,bs,512
+
+    auto query = network->addSlice(*pos_trans_out_shuffle->getOutput(0),
+                                    Dims3{0,0,0},
+                                    Dims3{num_query,batch_size,embed_dim},
+                                    Dims3{1,1,1});
+    auto query_pos = network->addSlice(*pos_trans_out_shuffle->getOutput(0),
+                                    Dims3{0,0,embed_dim},
+                                    Dims3{num_query,batch_size,embed_dim},
+                                    Dims3{1,1,1});
+
+    
+    auto memory_shuffle2 = network->addShuffle(*output_memory_and_proposal[0]);
+    memory_shuffle2->setName((lname+".memory_shuffle2").c_str());
+    memory_shuffle2->setFirstTranspose(Permutation{1,0,2}); // HW,bs,256
+
+
+    ITensor** out_query_and_bbox;
+    out_query_and_bbox = TransformerDecoder(network,weightMap,lname+".decoder",
+                        *query->getOutput(0),
+                        *query_pos->getOutput(0),
+                        *memory_shuffle2->getOutput(0),
+                        *decoder_reference_points->getOutput(0),
+                        *spatial_shapes_tensor->getOutput(0),
+                        *level_start_indexs_tensor->getOutput(0),
+                        6);
+
+
+    return out_query_and_bbox;
 }
-
-
-
-
 
 
