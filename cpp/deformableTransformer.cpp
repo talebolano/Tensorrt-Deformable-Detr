@@ -31,7 +31,6 @@ static const float ZEROFIVE = 0.5;
 
 ITensor* PositionEmbeddingSine(
 INetworkDefinition *network,
-std::unordered_map<std::string, Weights>& weightMap,
 ITensor& input,  // B,C,H,W
 int num_pos_feats = 64,
 int temperature = 10000
@@ -801,7 +800,7 @@ ITensor* InverseSigmoid(
 }
 
 
-ITensor** TransformerDecoder(
+std::vector<ITensor*>  TransformerDecoder(
     INetworkDefinition *network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
@@ -837,13 +836,13 @@ ITensor** TransformerDecoder(
                                             *reference_points_delta,
                                             ElementWiseOperation::kSUM);
         
-        auto new_refernce_point = network->addUnary(
+        auto new_refernce_point = network->addActivation(
                                             *new_refernce_point_inverse_sigmoid->getOutput(0),
-                                            UnaryOperation::kEXP);
+                                            ActivationType::kSIGMOID);
         reference_points_update = new_refernce_point->getOutput(0);
     }
 
-    ITensor * decoder_output[] = {out,reference_points_update};
+    std::vector<ITensor*>  decoder_output = {out,reference_points_update};
     return decoder_output;    
 }
 
@@ -898,7 +897,7 @@ ITensor* EncoderReferencePoints(
 }
 
 
-ITensor** GenEncoderOutputProposals(
+std::vector<ITensor*>  GenEncoderOutputProposals(
     INetworkDefinition *network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
@@ -965,7 +964,7 @@ ITensor** GenEncoderOutputProposals(
                             *enc_output_add->getOutput(0),
                             weightMap,
                             lname+".enc_output_norm",256);
-    ITensor* outputs[] = {enc_output_norm,output_proposal_inverse_sigmoid};
+    std::vector<ITensor*>  outputs = {enc_output_norm,output_proposal_inverse_sigmoid};
 
     return outputs;
 }
@@ -1033,12 +1032,12 @@ ITensor* ProPosalPosEmbed(
 }
 
 
-ITensor** Transformer(
+std::vector<ITensor*>  Transformer(
     INetworkDefinition *network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
-    ITensor** mlvl_feats, // b,c,h,w
-    ITensor** mlvl_pos_embeds, // 1,hw,c
+    std::vector<ITensor*>  mlvl_feats, // b,c,h,w
+    std::vector<ITensor*>  mlvl_pos_embeds, // 1,hw,c
     int num_level=4,
     int num_query=300,
     int embed_dim=256,
@@ -1120,7 +1119,7 @@ ITensor** Transformer(
     memory_shuffle->setName((lname+".memory_shuffle").c_str());
     memory_shuffle->setFirstTranspose(Permutation{1,0,2});
 
-    ITensor** output_memory_and_proposal;
+    std::vector<ITensor*>  output_memory_and_proposal;
 
     output_memory_and_proposal = GenEncoderOutputProposals(network,weightMap,lname,*memory_shuffle->getOutput(0),spatial_shapes_vector,embed_dim);
 
@@ -1184,19 +1183,57 @@ ITensor** Transformer(
     memory_shuffle2->setName((lname+".memory_shuffle2").c_str());
     memory_shuffle2->setFirstTranspose(Permutation{1,0,2}); // HW,bs,256
 
-
-    ITensor** out_query_and_bbox;
-    out_query_and_bbox = TransformerDecoder(network,weightMap,lname+".decoder",
-                        *query->getOutput(0),
-                        *query_pos->getOutput(0),
-                        *memory_shuffle2->getOutput(0),
-                        *decoder_reference_points->getOutput(0),
-                        *spatial_shapes_tensor->getOutput(0),
-                        *level_start_indexs_tensor->getOutput(0),
-                        6);
-
+    std::vector<ITensor*>  out_query_and_bbox = TransformerDecoder(network,weightMap,lname+".decoder",
+                                                        *query->getOutput(0),
+                                                        *query_pos->getOutput(0),
+                                                        *memory_shuffle2->getOutput(0),
+                                                        *decoder_reference_points->getOutput(0),
+                                                        *spatial_shapes_tensor->getOutput(0),
+                                                        *level_start_indexs_tensor->getOutput(0),
+                                                        6);
 
     return out_query_and_bbox;
 }
 
+
+std::vector<ITensor*> DeformableDetrHead(
+    INetworkDefinition *network,
+    std::unordered_map<std::string, Weights>& weightMap,
+    const std::string& lname,
+    std::vector<ITensor*>  mlvl_feats, // b,c,h,w
+    int num_level=4,
+    int num_query=300,
+    int embed_dim=256,
+    int num_classes=80    
+){
+    // get mlvl_positional_encodings
+    //get spatial_shapes
+    //get level_start_index
+    int batch_size = mlvl_feats[0]->getDimensions().d[0];
+    std::vector<ITensor*>  mlvl_positional_encodings(num_level);
+
+    int num_hw = 0;
+    for(int i=0;i<num_level;++i){
+        std::vector<int> temp(2);
+
+        mlvl_positional_encodings[i] = PositionEmbeddingSine(network,*mlvl_feats[i],embed_dim/2,10000);
+    }
+
+    std::vector<ITensor*>  out_query_and_bbox = Transformer(network,weightMap,lname+".transformer",
+                                                            mlvl_feats,
+                                                            mlvl_positional_encodings,
+                                                            num_level,num_query,embed_dim,num_classes);
+
+    auto out_query_shuffle = network->addShuffle(*out_query_and_bbox[0]);
+    out_query_shuffle->setName((lname+".out_query_shuffle").c_str());
+    out_query_shuffle->setFirstTranspose(Permutation{1,0,2}); // bs,300,256
+
+    ITensor* out_cls = ClsRegBranch(network,weightMap,"bbox_head.reg_branches.5",
+                                    *out_query_shuffle->getOutput(0),
+                                    embed_dim,num_classes);// bs,300,80
+
+    std::vector<ITensor*> output = { out_cls, out_query_and_bbox[1]};
+
+    return output;
+}
 

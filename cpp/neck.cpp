@@ -88,18 +88,16 @@ ITensor* GroupNorm(
 }
 
 
-ITensor** ChannelMapper(
-    ITensor* &inputs,
+std::vector<ITensor*> ChannelMapper(
+    std::vector<ITensor*> inputs,
     INetworkDefinition* network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
-    int out_channels=256,
-    int num_input=3,
-    int num_output=4 
+    int out_channels=256
 ){
     // conv1
     auto conv1 = network->addConvolutionNd(
-        inputs[0],
+        *inputs[0],
         out_channels,
         DimsHW{ 1, 1 },
         weightMap[lname + ".convs.0.conv.weight"],
@@ -112,7 +110,7 @@ ITensor** ChannelMapper(
 
     // conv2
     auto conv2 = network->addConvolutionNd(
-        inputs[1],
+        *inputs[1],
         out_channels,
         DimsHW{ 1, 1 },
         weightMap[lname + ".convs.1.conv.weight"],
@@ -125,7 +123,7 @@ ITensor** ChannelMapper(
 
     // conv3
     auto conv3 = network->addConvolutionNd(
-        inputs[2],
+        *inputs[2],
         out_channels,
         DimsHW{ 1, 1 },
         weightMap[lname + ".convs.2.conv.weight"],
@@ -138,7 +136,7 @@ ITensor** ChannelMapper(
 
     // conv4
     auto conv4 = network->addConvolutionNd(
-        inputs[2],
+        *inputs[2],
         out_channels,
         DimsHW{ 3, 3 },
         weightMap[lname + ".extra_convs.0.conv.weight"],
@@ -149,7 +147,7 @@ ITensor** ChannelMapper(
 
     ITensor* output4 = GroupNorm(network,weightMap,lname+".extra_convs.0.gn",*conv4->getOutput(0),32);    
 
-    ITensor * neck_output[] = {output1,output2,output3,output4};
+    std::vector<ITensor*>  neck_output = {output1,output2,output3,output4};
 
     return neck_output;
 }
