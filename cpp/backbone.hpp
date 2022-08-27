@@ -300,6 +300,7 @@ int res5_dilation = 1
     out = stem->getOutput(0);
 
     std::vector<ITensor*> mlvl_feats;
+    mlvl_feats.reserve(3);
     // res
     for (int i = 0; i < 4; ++i) {
         int dilation = (i == 3) ? res5_dilation : 1;
@@ -320,9 +321,10 @@ int res5_dilation = 1
         bottleneck_channels *= 2;
         out_channels *= 2;
 
-        if(i>1){
+        if(i>0){
             mlvl_feats.push_back(out);
         }
     }
+
     return mlvl_feats;
 }
