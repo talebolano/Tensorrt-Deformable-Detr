@@ -6,6 +6,10 @@
 #include <unordered_map>
 #include <NvInfer.h>
 #include <NvInferVersion.h>
+#include <cuda_runtime.h>
+#include "backbone.hpp"
+#include "neck.hpp"
+
 
 #define DEVICE 0
 #define BATCH_SIZE 1
@@ -26,7 +30,10 @@ static const float SHIFT_ZERO = 0.0;
 static const float POWER_TWO = 2.0;
 static const float EPS = 0.00001;
 static const float ZEROFIVE = 0.5;
-
+static const int NUM_CLASS = 80; 
+static const int NUM_QUERIES = 300;
+static const float SCORE_THRESH = 0.5;
+const std::vector<std::string> OUTPUT_NAMES = { "scores", "boxes"};
 
 
 ITensor* PositionEmbeddingSine(
@@ -1237,3 +1244,269 @@ std::vector<ITensor*> DeformableDetrHead(
     return output;
 }
 
+
+ICudaEngine* createEngine_r50detr(
+unsigned int maxBatchSize,
+const std::string& wtsfile,
+IBuilder* builder,
+IBuilderConfig* config,
+DataType dt,
+const std::string& modelType = "fp16",
+const int input_H = 750,
+const int input_W = 1333
+) {
+    // 显式batch
+    const auto explicitBatch = 1U << static_cast<uint32_t>(NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    INetworkDefinition* network = builder->createNetworkV2(explicitBatch);
+
+    // Create input tensor of shape {3, INPUT_H, INPUT_W} with name INPUT_BLOB_NAME
+    ITensor* data = network->addInput("input", dt, Dims4{ 1, 3, input_H, input_W });
+
+    // preprocess
+    std::unordered_map<std::string, Weights> weightMap;
+    loadWeights(wtsfile, weightMap);
+
+    // backbone
+    std::vector<ITensor*> mlvl_features = BuildResNet(network, weightMap, *data, R50, 64, 64, 256);
+
+    std::vector<ITensor*> mlvl_feat = ChannelMapper(mlvl_features,network, weightMap, "neck", 256);
+
+    std::vector<ITensor*> results = DeformableDetrHead(network, weightMap, "bbox_head",mlvl_feat,4,300,256,80);
+
+    // build output
+    for (int i = 0; i < results.size(); i++) {
+        network->markOutput(*results[i]);
+        results[i]->setName(OUTPUT_NAMES[i].c_str());
+    }
+
+    // build engine
+    builder->setMaxBatchSize(maxBatchSize);
+    config->setMaxWorkspaceSize(1ULL << 30);
+
+    if (modelType == "fp32") {
+    } else if (modelType == "fp16") {
+        config->setFlag(BuilderFlag::kFP16);
+    } else {
+        throw("does not support model type");
+    }
+
+    std::cout << "Building engine, please wait for a while..." << std::endl;
+    ICudaEngine* engine = builder->buildEngineWithConfig(*network, *config);
+    std::cout << "Build engine successfully!" << std::endl;
+
+    // destroy network
+    network->destroy();
+
+    // Release host memory
+    for (auto& mem : weightMap) {
+        free((void*)(mem.second.values));
+    }
+    return engine;
+}
+
+
+void BuildDETRModel(unsigned int maxBatchSize, IHostMemory** modelStream,
+const std::string& wtsfile, std::string modelType = "fp32") {
+    // Create builder
+    IBuilder* builder = createInferBuilder(gLogger);
+    IBuilderConfig* config = builder->createBuilderConfig();
+
+    // Create model to populate the network, then set the outputs and create an engine
+    ICudaEngine* engine = createEngine_r50detr(maxBatchSize,
+        wtsfile, builder, config, DataType::kFLOAT, modelType);
+    assert(engine != nullptr);
+
+    // Serialize the engine
+    (*modelStream) = engine->serialize();
+
+    // Close everything down
+    engine->destroy();
+    builder->destroy();
+}
+
+
+void doInference(IExecutionContext& context, cudaStream_t& stream, std::vector<void*>& buffers,
+std::vector<float>& input, std::vector<float*>& output) {
+    CUDA_CHECK(cudaMemcpyAsync(buffers[0], input.data(), input.size() * sizeof(float),
+    cudaMemcpyHostToDevice, stream));
+
+    context.enqueueV2( buffers.data(), stream, nullptr);
+
+    CUDA_CHECK(cudaMemcpyAsync(output[0], buffers[1], BATCH_SIZE * NUM_QUERIES * NUM_CLASS * sizeof(float),
+    cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(output[1], buffers[2], BATCH_SIZE * NUM_QUERIES * 4 * sizeof(float),
+    cudaMemcpyDeviceToHost, stream));
+
+    cudaStreamSynchronize(stream);
+}
+
+bool parse_args(int argc, char** argv, std::string& wtsFile, std::string& engineFile, std::string& imgDir) {
+    if (argc < 4) return false;
+    if (std::string(argv[1]) == "-s") {
+        wtsFile = std::string(argv[2]);
+        engineFile = std::string(argv[3]);
+    } else if (std::string(argv[1]) == "-d") {
+        engineFile = std::string(argv[2]);
+        imgDir = std::string(argv[3]);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+int main(int argc, char** argv) {
+    cudaSetDevice(DEVICE);
+
+    std::string wtsFile = "";
+    std::string engineFile = "";
+
+    std::string imgDir;
+    if (!parse_args(argc, argv, wtsFile, engineFile, imgDir)) {
+        std::cerr << "arguments not right!" << std::endl;
+        std::cerr << "./detr -s [.wts] [.engine] // serialize model to plan file" << std::endl;
+        std::cerr << "./detr -d [.engine] ../samples // deserialize plan file and run inference" << std::endl;
+        return -1;
+    }
+
+    if (!wtsFile.empty()) {
+        IHostMemory* modelStream{ nullptr };
+        BuildDETRModel(BATCH_SIZE, &modelStream, wtsFile, "fp32");
+        assert(modelStream != nullptr);
+        std::ofstream p(engineFile, std::ios::binary);
+        if (!p) {
+            std::cerr << "could not open plan output file" << std::endl;
+            return -1;
+        }
+        p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
+        modelStream->destroy();
+        return 0;
+    }
+
+    // deserialize the .engine and run inference
+    std::ifstream file(engineFile, std::ios::binary);
+    if (!file.good()) {
+        std::cerr << "read " << engineFile << " error!" << std::endl;
+        return -1;
+    }
+
+    std::string trtModelStream;
+    size_t modelSize{ 0 };
+    file.seekg(0, file.end);
+    modelSize = file.tellg();
+    file.seekg(0, file.beg);
+    trtModelStream.resize(modelSize);
+    assert(!trtModelStream.empty());
+    file.read(const_cast<char*>(trtModelStream.c_str()), modelSize);
+    file.close();
+
+    // build engine
+    std::cout << "build engine" << std::endl;
+    IRuntime* runtime = createInferRuntime(gLogger);
+    assert(runtime != nullptr);
+    ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream.c_str(), modelSize);
+    assert(engine != nullptr);
+    IExecutionContext* context = engine->createExecutionContext();
+    assert(context != nullptr);
+    runtime->destroy();
+
+    int input_h = context->getBindingDimensions(0).d[2];
+    int input_w = context->getBindingDimensions(0).d[3];
+
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    // prepare input file
+    std::vector<std::string> fileList;
+    if (read_files_in_dir(imgDir.c_str(), fileList) < 0) {
+        std::cerr << "read_files_in_dir failed." << std::endl;
+        return -1;
+    }
+
+    // calculate input size
+    int input_size = CalculateSize(context->getBindingDimensions(0));
+
+    // prepare input data
+    std::vector<float> data(BATCH_SIZE * input_size, 0);
+    void *data_d, *scores_d, *boxes_d;
+    CUDA_CHECK(cudaMalloc(&data_d, BATCH_SIZE * input_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&scores_d, BATCH_SIZE * NUM_QUERIES * NUM_CLASS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&boxes_d, BATCH_SIZE * NUM_QUERIES * 4 * sizeof(float)));
+
+    std::vector<float> scores_h(BATCH_SIZE * NUM_QUERIES * NUM_CLASS);
+    std::vector<float> boxes_h(BATCH_SIZE * NUM_QUERIES * 4);
+
+    std::vector<void*> buffers = { data_d, scores_d, boxes_d };
+    std::vector<float*> outputs = {scores_h.data(), boxes_h.data()};
+
+    int fcount = 0;
+    int fileLen = fileList.size();
+    for (int f = 0; f < fileLen; f++) {
+        fcount++;
+        if (fcount < BATCH_SIZE && f + 1 != fileLen) continue;
+
+        for (int b = 0; b < fcount; b++) {
+            cv::Mat img = cv::imread(imgDir + "/" + fileList[f - fcount + 1 + b]);
+            if (img.empty()) continue;
+            preprocessImg(img, input_h, input_w);
+            assert(img.cols * img.rows * 3 == input_size);
+            for (int c = 0; c < 3; c++) {
+                for (int h = 0; h < img.rows; h++) {
+                    for (int w = 0; w < img.cols; w++) {
+                        data[b * input_size +
+                        c * img.rows * img.cols + h * img.cols + w] = img.at<cv::Vec3f>(h, w)[c];
+                    }
+                }
+            }
+        }
+
+        // Run inference
+        auto start = std::chrono::system_clock::now();
+
+        doInference(*context, stream, buffers, data, outputs);
+
+        auto end = std::chrono::system_clock::now();
+        std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+
+        for (int b = 0; b < fcount; b++) {
+            cv::Mat img = cv::imread(imgDir + "/" + fileList[f - fcount + 1 + b]);
+            for (int i = 0; i < scores_h.size(); i += NUM_CLASS) {
+                int label = -1;
+                float score = -1;
+                for (int j = i; j < i + NUM_CLASS; j++) {
+                    if (score < scores_h[j]) {
+                        label = j;
+                        score = scores_h[j];
+                    }
+                }
+                if (score > SCORE_THRESH && (label % NUM_CLASS != NUM_CLASS - 1)) {
+                    int ind = label / NUM_CLASS;
+                    label = label % NUM_CLASS;
+                    float cx = boxes_h[ind * 4];
+                    float cy = boxes_h[ind * 4 + 1];
+                    float w = boxes_h[ind * 4 + 2];
+                    float h = boxes_h[ind * 4 + 3];
+                    float x1 = (cx - w / 2.0) * img.cols;
+                    float y1 = (cy - h / 2.0) * img.rows;
+                    float x2 = (cx + w / 2.0) * img.cols;
+                    float y2 = (cy + h / 2.0) * img.rows;
+                    cv::Rect r(x1, y1, x2 - x1, y2 - y1);
+                    cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
+                    cv::putText(img, std::to_string(label), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2,
+                    cv::Scalar(0xFF, 0xFF, 0xFF), 2);
+                }
+            }
+            cv::imwrite("_" + fileList[f - fcount + 1 + b], img);
+        }
+        fcount = 0;
+    }
+
+    cudaStreamDestroy(stream);
+    CUDA_CHECK(cudaFree(data_d));
+    CUDA_CHECK(cudaFree(scores_d));
+    CUDA_CHECK(cudaFree(boxes_d));
+    context->destroy();
+    engine->destroy();
+
+    return 0;
+}
