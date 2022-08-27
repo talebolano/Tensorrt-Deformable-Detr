@@ -1,9 +1,5 @@
-import cv2
 import argparse
-import torch
 from mmdet.apis import init_detector
-import torchvision.transforms as T
-from PIL import Image
 import struct
 
 
