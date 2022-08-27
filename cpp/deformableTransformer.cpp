@@ -638,14 +638,16 @@ ITensor* TransformerDecoderLayer(
     auto reference_points_num_level = network->addShuffle(reference_points);
     reference_points_num_level->setName((lname+".reference_points_num_level").c_str());
 
-    auto valid_ratios = network->addConstant(Dims4{1,1,4,1},Weights{DataType::kFLOAT,&SCALING_ONE,1});
-    reference_points_num_level->setReshapeDimensions(Dims4{batch_size,tgt_len,1,4});
+    int valid_ratios_ones[4] = {1,1,1,1};
+    auto valid_ratios = network->addConstant(Dims4{1,1,4,1},Weights{DataType::kFLOAT,&valid_ratios_ones,4});
+    reference_points_num_level->setReshapeDimensions(Dims4{-1,tgt_len,1,4});
     auto reference_points_num_level2 = network->addElementWise(
         *reference_points_num_level->getOutput(0),
         *valid_ratios->getOutput(0),
         ElementWiseOperation::kPROD
     );
 
+    auto reference_points_num_level2_size = reference_points_num_level2->getOutput(0)->getDimensions();
 
     auto query_embed_add1 = network->addElementWise(
                             query,
@@ -724,14 +726,14 @@ ITensor* RegBranch(
 
     auto activation1 = network->addActivation(*linear1_add->getOutput(0),ActivationType::kRELU);
 
-    auto linear2_weights = network->addConstant(Dims3{1,d_model,d_model},weightMap[lname + ".1.weight"]);
+    auto linear2_weights = network->addConstant(Dims3{1,d_model,d_model},weightMap[lname + ".2.weight"]);
     auto linear2_mul = network->addMatrixMultiply(
         *activation1->getOutput(0),
         MatrixKNONE,
         *linear2_weights->getOutput(0),
         MatrixKNONE);
     assert(linear2_mul);
-    auto linear2_bias = network->addConstant(Dims3{1,1,d_model},weightMap[lname + ".1.bias"]);
+    auto linear2_bias = network->addConstant(Dims3{1,1,d_model},weightMap[lname + ".2.bias"]);
     auto linear2_add = network->addElementWise(
         *linear2_mul->getOutput(0),
         *linear2_bias->getOutput(0),
@@ -741,14 +743,14 @@ ITensor* RegBranch(
 
     auto activation2 = network->addActivation(*linear2_add->getOutput(0),ActivationType::kRELU);
 
-    auto linear3_weights = network->addConstant(Dims3{1,d_model,out_dim},weightMap[lname + ".2.weight"]);
+    auto linear3_weights = network->addConstant(Dims3{1,d_model,out_dim},weightMap[lname + ".4.weight"]);
     auto linear3_mul = network->addMatrixMultiply(
         *activation2->getOutput(0),
         MatrixKNONE,
         *linear3_weights->getOutput(0),
         MatrixKNONE);
     assert(linear3_mul);
-    auto linear3_bias = network->addConstant(Dims3{1,1,out_dim},weightMap[lname + ".2.bias"]);
+    auto linear3_bias = network->addConstant(Dims3{1,1,out_dim},weightMap[lname + ".4.bias"]);
     auto linear3_add = network->addElementWise(
         *linear3_mul->getOutput(0),
         *linear3_bias->getOutput(0),
@@ -920,8 +922,6 @@ ITensor* EncoderReferencePoints(
 
     auto reference_points_constant = network->addConstant(
                     Dims4{1,reference_points_size,1,2},reference_points_weight);
-
-    auto reference_points_constant_size = reference_points_constant->getOutput(0)->getDimensions();
 
     int valid_ratios_ones[4] = {1,1,1,1};
 
@@ -1164,37 +1164,25 @@ std::vector<ITensor*>  Transformer(
 
     output_memory_and_proposal = GenEncoderOutputProposals(network,weightMap,lname,*memory_shuffle->getOutput(0),spatial_shapes_vector,embed_dim);
 
-    auto output_memory_size = output_memory_and_proposal[0]->getDimensions();
-    auto output_proposal_size = output_memory_and_proposal[1]->getDimensions();
-
     ITensor* enc_outputs_class = ClsBranch(network,weightMap,"bbox_head.cls_branches.6",*output_memory_and_proposal[0],embed_dim,num_classes);
 
-    auto enc_outputs_class_size = enc_outputs_class->getDimensions();
-
     ITensor* enc_outputs_coord_unact_delta = RegBranch(network,weightMap,"bbox_head.reg_branches.6",*output_memory_and_proposal[0],embed_dim,4);
-    
-    auto enc_outputs_coord_unact_delta_size = enc_outputs_coord_unact_delta->getDimensions();
 
     auto enc_outputs_coord_unact = network->addElementWise(*output_memory_and_proposal[1],
                                                             *enc_outputs_coord_unact_delta,
                                                             ElementWiseOperation::kSUM);
-    
+    //TODO:addSlice动态裁剪
     auto enc_outputs_class_one = network->addSlice(*enc_outputs_class,Dims3{0,0,0},Dims3{batch_size,num_hw,1},Dims3{1,1,1});
 
-    auto enc_outputs_class_one_size = enc_outputs_class_one->getOutput(0)->getDimensions();
+    auto topk_proposals = network->addTopK(*enc_outputs_class_one->getOutput(0),TopKOperation::kMAX,num_query,1<<1); // bs,300,1
 
-    auto topk_proposals = network->addTopK(*enc_outputs_class_one->getOutput(0),TopKOperation::kMAX,num_query,1); // bs,300,1
-
-    auto topk_proposals_size = topk_proposals->getOutput(0)->getDimensions();
     // TODO: 重点检查，可能出错
-    auto topk_coords_unact = network->addGatherV2(*enc_outputs_coord_unact->getOutput(0),*topk_proposals->getOutput(1),GatherMode::kELEMENT); //// bs,300,4
-
-    auto topk_coords_unact_size = topk_coords_unact->getOutput(0)->getDimensions();
+    auto topk_proposals_repeat = network->addSlice(*topk_proposals->getOutput(1),Dims3{0,0,0},Dims3{batch_size,num_query,4},Dims3{1,1,1});
+    auto topk_coords_unact = network->addGatherV2(*enc_outputs_coord_unact->getOutput(0),*topk_proposals_repeat->getOutput(0),GatherMode::kELEMENT); //// bs,300,4
 
     auto decoder_reference_points = network->addActivation(*topk_coords_unact->getOutput(0),ActivationType::kSIGMOID);
 
     ITensor* pos_trans_out = ProPosalPosEmbed(network,lname,*decoder_reference_points->getOutput(0));//bs,300,512
-
 
     auto pos_trans_out_weight = network->addConstant(Dims3{1,2*embed_dim,2*embed_dim},
                             weightMap[lname+".pos_trans.weight"]);
@@ -1231,7 +1219,6 @@ std::vector<ITensor*>  Transformer(
                                     Dims3{0,0,embed_dim},
                                     Dims3{num_query,batch_size,embed_dim},
                                     Dims3{1,1,1});
-
     
     auto memory_shuffle2 = network->addShuffle(*output_memory_and_proposal[0]);
     memory_shuffle2->setName((lname+".memory_shuffle2").c_str());
@@ -1284,8 +1271,9 @@ std::vector<ITensor*> DeformableDetrHead(
     ITensor* out_cls = ClsBranch(network,weightMap,"bbox_head.cls_branches.5",
                                     *out_query_shuffle->getOutput(0),
                                     embed_dim,num_classes);// bs,300,80
+    auto out_cls_sigmoid = network->addActivation(*out_cls,ActivationType::kSIGMOID);
 
-    std::vector<ITensor*> output = { out_cls, out_query_and_bbox[1]};
+    std::vector<ITensor*> output = { out_cls_sigmoid->getOutput(0), out_query_and_bbox[1]};
 
     return output;
 }
