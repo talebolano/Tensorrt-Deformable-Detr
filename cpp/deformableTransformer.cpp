@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <NvInfer.h>
+#include <NvInferPlugin.h>
 #include <NvInferVersion.h>
 #include <cuda_runtime.h>
 #include "backbone.hpp"
@@ -25,11 +26,6 @@ using namespace nvinfer1;
 #define MatrixTRANS true
 #endif
 static const float SCALING = 0.17677669529663687;
-static const float SCALING_ONE = 1.0;
-static const float SHIFT_ZERO = 0.0;
-static const float POWER_TWO = 2.0;
-static const float EPS = 0.00001;
-static const float ZEROFIVE = 0.5;
 static const int NUM_CLASS = 80; 
 static const int NUM_QUERIES = 300;
 static const float SCORE_THRESH = 0.5;
@@ -42,7 +38,7 @@ ITensor& input,  // B,C,H,W
 int num_pos_feats = 64,
 int temperature = 10000
 ) {
-    // out 1,H*W,C
+    // out H*W,1,C
     // refer to https://github.com/facebookresearch/detr/blob/master/models/position_encoding.py#12
     // TODO: improve this implementation
     auto mask_dim = input.getDimensions(); // B,C,H,W
@@ -110,7 +106,7 @@ int temperature = 10000
         }
     }
     Weights pos_embed_weight{ DataType::kFLOAT, pval, h * w * num_pos_feats * 2 };
-    auto pos_embed = network->addConstant(Dims3{ 1, h * w, num_pos_feats * 2 }, pos_embed_weight);
+    auto pos_embed = network->addConstant(Dims3{ h * w, 1, num_pos_feats * 2 }, pos_embed_weight);
     assert(pos_embed);
     return pos_embed->getOutput(0);
 }
@@ -353,7 +349,7 @@ ITensor* MultiScaleDeformHeadAttention(
 
     int batch_size = query.getDimensions().d[1];
     int tgt_len = query.getDimensions().d[0];
-    int num_value = value.getDimensions().d[1];
+    int num_value = value.getDimensions().d[0];
 
     auto q_stuffle = network->addShuffle(query);
     q_stuffle->setName((lname+".q_shuffle").c_str());
@@ -405,7 +401,7 @@ ITensor* MultiScaleDeformHeadAttention(
 
     auto sampling_offset_shuffle = network->addShuffle(*sampling_offset_add->getOutput(0));
     sampling_offset_shuffle->setName((lname+".sampling_shuffle").c_str());
-    sampling_offset_shuffle->setReshapeDimensions(Dims{6, {batch_size, tgt_len, num_heads, num_level, num_point,2}});
+    sampling_offset_shuffle->setReshapeDimensions(Dims{6, {-1, tgt_len, num_heads, num_level, num_point,2}});
     assert(sampling_offset_shuffle);
 
     // attention_weights
@@ -431,7 +427,7 @@ ITensor* MultiScaleDeformHeadAttention(
 
     auto attn_weight_shuffle = network->addShuffle(*attn_weight_add->getOutput(0));
     attn_weight_shuffle->setName((lname+".attn_weight_shuffle").c_str());
-    attn_weight_shuffle->setReshapeDimensions(Dims4{batch_size, tgt_len, num_heads, num_level*num_point});
+    attn_weight_shuffle->setReshapeDimensions(Dims4{-1, tgt_len, num_heads, num_level*num_point});
     assert(attn_weight_shuffle);       
 
     auto attn_weight_softmax = network->addSoftMax(*attn_weight_shuffle->getOutput(0));
@@ -440,7 +436,7 @@ ITensor* MultiScaleDeformHeadAttention(
 
     auto attn_weight_shuffle2 = network->addShuffle(*attn_weight_softmax->getOutput(0));
     attn_weight_shuffle2->setName((lname+".attn_weight_shuffle2").c_str());
-    attn_weight_shuffle2->setReshapeDimensions(Dims{5,{batch_size, tgt_len, num_heads, num_level,num_point}});
+    attn_weight_shuffle2->setReshapeDimensions(Dims{5,{-1, tgt_len, num_heads, num_level,num_point}});
     assert(attn_weight_shuffle2);
 
     IElementWiseLayer* sampling_locations;
@@ -469,7 +465,7 @@ ITensor* MultiScaleDeformHeadAttention(
                 ElementWiseOperation::kDIV
             );
 
-            auto sampling_locations = network->addElementWise(
+            sampling_locations = network->addElementWise(
                 *reference_point_shuffle->getOutput(0),
                 *sampling_offset_norm->getOutput(0),
                 ElementWiseOperation::kSUM
@@ -514,7 +510,7 @@ ITensor* MultiScaleDeformHeadAttention(
                 ElementWiseOperation::kPROD
             );
 
-            auto sampling_locations = network->addElementWise(
+            sampling_locations = network->addElementWise(
                 *reference_point_cxcy->getOutput(0),
                 *sampling_offset_norm3->getOutput(0),
                 ElementWiseOperation::kSUM
@@ -891,8 +887,11 @@ ITensor* EncoderReferencePoints(
     auto reference_points_constant = network->addConstant(
                     Dims4{1,reference_points_size,1,2},reference_points_weight);
 
+    auto reference_points_constant_size = reference_points_constant->getOutput(0)->getDimensions();
 
-    auto valid_ratios = network->addConstant(Dims4{1,1,spatial_shapes.size(),1},Weights{DataType::kFLOAT,&SCALING_ONE,1});
+    int valid_ratios_ones[4] = {1,1,1,1};
+
+    auto valid_ratios = network->addConstant(Dims4{1,1,spatial_shapes.size(),1},Weights{DataType::kFLOAT,&valid_ratios_ones,4});
 
     auto reference_points_num_level = network->addElementWise(
         *reference_points_constant->getOutput(0),
@@ -1057,7 +1056,8 @@ std::vector<ITensor*>  Transformer(
     int *spatial_shapes = reinterpret_cast<int*>(malloc(sizeof(int) * num_level * 2));
     int *level_start_indexs = reinterpret_cast<int*>(malloc(sizeof(int) * num_level));
 
-    std::vector<std::vector<int>> spatial_shapes_vector(num_level);
+    std::vector<std::vector<int>> spatial_shapes_vector;
+    spatial_shapes_vector.reserve(num_level);
     ITensor* mlvl_feats_flattens[num_level];
     ITensor* mlvl_pos_embed_flattens[num_level];
 
@@ -1071,8 +1071,8 @@ std::vector<ITensor*>  Transformer(
         int w = mlvl_feats[i]->getDimensions().d[3];
         auto mlvl_feats_flatten = network->addShuffle(*mlvl_feats[i]);
         mlvl_feats_flatten->setName((lname+".flatten."+std::to_string(i)).c_str());
-        mlvl_feats_flatten->setReshapeDimensions(Dims3{b,c,h*w});
-        mlvl_feats_flatten->setSecondTranspose(Permutation{2,0,1});
+        mlvl_feats_flatten->setReshapeDimensions(Dims3{-1,c,h*w}); // b,c,hw
+        mlvl_feats_flatten->setSecondTranspose(Permutation{2,0,1});// hw,b,c
         mlvl_feats_flattens[i] = mlvl_feats_flatten->getOutput(0);
 
         auto level_embed = network->addConstant(Dims3{1,1,embed_dim},
@@ -1098,12 +1098,12 @@ std::vector<ITensor*>  Transformer(
     auto feats_flattens = network->addConcatenation(
                                 mlvl_feats_flattens,
                                 num_level);
-    feats_flattens->setAxis(1); // HW,bs,c
+    feats_flattens->setAxis(0); // HW,bs,c
 
     auto pos_embed_flattens = network->addConcatenation(
                                 mlvl_pos_embed_flattens,
                                 num_level);
-    pos_embed_flattens->setAxis(1);// HW,1,c
+    pos_embed_flattens->setAxis(0);// HW,1,c
 
     auto spatial_shapes_tensor = network->addConstant(Dims2{num_level,2},
                                             Weights{DataType::kINT32,&spatial_shapes,num_level*2});
@@ -1207,7 +1207,7 @@ std::vector<ITensor*> DeformableDetrHead(
     INetworkDefinition *network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
-    std::vector<ITensor*>  mlvl_feats, // b,c,h,w
+    std::vector<ITensor*>  &mlvl_feats, // b,c,h,w
     int num_level=4,
     int num_query=300,
     int embed_dim=256,
@@ -1221,7 +1221,6 @@ std::vector<ITensor*> DeformableDetrHead(
 
     int num_hw = 0;
     for(int i=0;i<num_level;++i){
-        std::vector<int> temp(2);
 
         mlvl_positional_encodings[i] = PositionEmbeddingSine(network,*mlvl_feats[i],embed_dim/2,10000);
     }
@@ -1356,6 +1355,7 @@ bool parse_args(int argc, char** argv, std::string& wtsFile, std::string& engine
 
 int main(int argc, char** argv) {
     cudaSetDevice(DEVICE);
+    initLibNvInferPlugins(&gLogger,"");
 
     std::string wtsFile = "";
     std::string engineFile = "";
@@ -1363,8 +1363,8 @@ int main(int argc, char** argv) {
     std::string imgDir;
     if (!parse_args(argc, argv, wtsFile, engineFile, imgDir)) {
         std::cerr << "arguments not right!" << std::endl;
-        std::cerr << "./detr -s [.wts] [.engine] // serialize model to plan file" << std::endl;
-        std::cerr << "./detr -d [.engine] ../samples // deserialize plan file and run inference" << std::endl;
+        std::cerr << "./deformabledetr -s [.wts] [.engine] // serialize model to plan file" << std::endl;
+        std::cerr << "./deformabledetr -d [.engine] ../samples // deserialize plan file and run inference" << std::endl;
         return -1;
     }
 
