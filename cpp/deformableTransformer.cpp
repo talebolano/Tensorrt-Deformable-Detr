@@ -208,7 +208,7 @@ int num_heads = 8
 
     auto softmax = network->addSoftMax(*q_product_k->getOutput(0));
     assert(softmax);
-    softmax->setAxes(2); //
+    softmax->setAxes(1<<2); //
 
     auto attn_product_v = network->addMatrixMultiply(*softmax->getOutput(0), MatrixKNONE, *v_shuffle->getOutput(0), MatrixKNONE);
     assert(attn_product_v); // nh*bs,q,c
@@ -376,12 +376,12 @@ ITensor* MultiScaleDeformHeadAttention(
 
     // TODO: 在value添加keypadding mask
     auto v_stuffle_2 = network->addShuffle(*value_proj_add->getOutput(0));
-    v_stuffle->setName((lname+".v_shuffle_2").c_str());
-    v_stuffle->setReshapeDimensions(Dims4{batch_size,num_value,num_heads,-1});    
+    v_stuffle_2->setName((lname+".v_shuffle_2").c_str());
+    v_stuffle_2->setReshapeDimensions(Dims4{-1,num_value,num_heads,embed_dim/num_heads});    
 
     // sampling_offset
     auto sampling_offset_weights = network->addConstant(
-                    Dims3{1,num_heads * num_level * num_point * 2,num_heads * num_level * num_point * 2},
+                    Dims3{1,embed_dim,num_heads * num_level * num_point * 2},
                     weightMap[lname+".sampling_offsets.weight"]);
     auto sampling_offset_mul = network->addMatrixMultiply(
         *q_stuffle->getOutput(0),
@@ -389,6 +389,7 @@ ITensor* MultiScaleDeformHeadAttention(
         *sampling_offset_weights->getOutput(0),
         MatrixKNONE
     );
+
     assert(sampling_offset_mul);
     auto sampling_offset_bias = network->addConstant(Dims3{1,1,num_heads * num_level * num_point * 2},
                     weightMap[lname+".sampling_offsets.bias"]);
@@ -406,7 +407,7 @@ ITensor* MultiScaleDeformHeadAttention(
 
     // attention_weights
     auto attn_weight_weights = network->addConstant(
-                    Dims3{1,num_heads * num_level * num_point,num_heads * num_level * num_point},
+                    Dims3{1,embed_dim,num_heads * num_level * num_point},
                     weightMap[lname+".attention_weights.weight"]);
     auto attn_weight_mul = network->addMatrixMultiply(
         *q_stuffle->getOutput(0),
@@ -414,6 +415,7 @@ ITensor* MultiScaleDeformHeadAttention(
         *attn_weight_weights->getOutput(0),
         MatrixKNONE
     );
+
     assert(attn_weight_mul);
     auto attn_weight_bias = network->addConstant(
                     Dims3{1,1,num_heads * num_level * num_point},
@@ -431,7 +433,7 @@ ITensor* MultiScaleDeformHeadAttention(
     assert(attn_weight_shuffle);       
 
     auto attn_weight_softmax = network->addSoftMax(*attn_weight_shuffle->getOutput(0));
-    attn_weight_softmax->setAxes(3);
+    attn_weight_softmax->setAxes(1<<3);
     assert(attn_weight_softmax);
 
     auto attn_weight_shuffle2 = network->addShuffle(*attn_weight_softmax->getOutput(0));
@@ -453,15 +455,17 @@ ITensor* MultiScaleDeformHeadAttention(
 
             auto reference_point_shuffle = network->addShuffle(reference_points);
             reference_point_shuffle->setName((lname+".reference_point_shuffle").c_str());
-            reference_point_shuffle->setReshapeDimensions(Dims{6,{batch_size,tgt_len,1,num_level,1,point_size}});
+            reference_point_shuffle->setReshapeDimensions(Dims{6,{-1,tgt_len,1,num_level,1,point_size}});
 
             auto offset_normalizer_shuffle = network->addShuffle(*offset_normalizer->getOutput(0));
             offset_normalizer_shuffle->setName((lname+".offset_normalizer_shuffle").c_str());
             offset_normalizer_shuffle->setReshapeDimensions(Dims{6,{1,1,1,num_level,1,point_size}});
+            auto offset_normalizer_cast = network->addIdentity(*offset_normalizer_shuffle->getOutput(0));
+            offset_normalizer_cast->setOutputType(0,DataType::kFLOAT);
 
             auto sampling_offset_norm = network->addElementWise(
                 *sampling_offset_shuffle->getOutput(0),
-                *offset_normalizer_shuffle->getOutput(0),
+                *offset_normalizer_cast->getOutput(0),
                 ElementWiseOperation::kDIV
             );
 
@@ -521,13 +525,13 @@ ITensor* MultiScaleDeformHeadAttention(
     const PluginFieldCollection* plugin_data = creator->getFieldNames();
     IPluginV2* plugin_obj = creator->createPlugin((lname+".MultiscaleDeformableAttn").c_str(),plugin_data);
 
-    ITensor * mshda[] = {v_stuffle->getOutput(0),&spatial_shapes,&level_start_index,sampling_locations->getOutput(0),attn_weight_shuffle2->getOutput(0)};
+    ITensor * mshda[] = {v_stuffle_2->getOutput(0),&spatial_shapes,&level_start_index,sampling_locations->getOutput(0),attn_weight_shuffle2->getOutput(0)};
     //do sample plugin
     auto multi_scale_deformable_attn = network->addPluginV2(mshda,5,*plugin_obj);
 
     auto multi_scale_deformable_attn_shuffle = network->addShuffle(*multi_scale_deformable_attn->getOutput(0));
     multi_scale_deformable_attn_shuffle->setName((lname+".multi_scale_deformable_attn_shuffle").c_str());
-    multi_scale_deformable_attn_shuffle->setReshapeDimensions(Dims3(batch_size,tgt_len,embed_dim));
+    multi_scale_deformable_attn_shuffle->setReshapeDimensions(Dims3(-1,tgt_len,embed_dim));
     multi_scale_deformable_attn_shuffle->setSecondTranspose(Permutation{1,0,2}); // num_q,bs,c
 
     auto output_proj_weight = network->addConstant(Dims3{1,embed_dim,embed_dim},weightMap[lname+".output_proj.weight"]);
@@ -545,6 +549,8 @@ ITensor* MultiScaleDeformHeadAttention(
         *output_proj_bias->getOutput(0),
         ElementWiseOperation::kSUM
     );
+
+    auto output_proj_add_size = output_proj_add->getOutput(0)->getDimensions();
     return output_proj_add->getOutput(0);
 }
 
@@ -580,7 +586,7 @@ ITensor* TransformerEncoderLayer(
     
     ITensor* norm1 = LayerNorm(network,*Identity1->getOutput(0),weightMap,lname+".norms.0",256);
 
-    ITensor* ffn1 = FFN(network,*norm1,weightMap,lname+".ffn.0",256,4);
+    ITensor* ffn1 = FFN(network,*norm1,weightMap,lname+".ffns.0",256,4);
 
     auto Identity2 = network->addElementWise(
         *ffn1,
@@ -679,7 +685,7 @@ ITensor* TransformerDecoderLayer(
 
     ITensor* norm2 = LayerNorm(network,*Identity2->getOutput(0),weightMap,lname+".norms.1",256);
 
-    ITensor* ffn1 = FFN(network,*norm2,weightMap,lname+".ffn.0",256,4);
+    ITensor* ffn1 = FFN(network,*norm2,weightMap,lname+".ffns.0",256,4);
 
     auto Identity3= network->addElementWise(
         *ffn1,
@@ -692,7 +698,7 @@ ITensor* TransformerDecoderLayer(
     return norm3;
 }
 
-ITensor* ClsRegBranch(
+ITensor* RegBranch(
     INetworkDefinition *network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
@@ -749,6 +755,34 @@ ITensor* ClsRegBranch(
         ElementWiseOperation::kSUM
     );
     assert(linear3_add);     
+
+    return linear3_add->getOutput(0);
+}
+
+
+ITensor* ClsBranch(
+    INetworkDefinition *network,
+    std::unordered_map<std::string, Weights>& weightMap,
+    const std::string& lname,
+    ITensor& input, //  bs, num_query, 4
+    int d_model = 256,
+    int out_dim = 4
+){
+
+    auto linear1_weights = network->addConstant(Dims3{1,d_model,out_dim},weightMap[lname + ".weight"]);
+    auto linear1_mul = network->addMatrixMultiply(
+        input,
+        MatrixKNONE,
+        *linear1_weights->getOutput(0),
+        MatrixKNONE);
+    assert(linear1_mul);
+    auto linear1_bias = network->addConstant(Dims3{1,1,out_dim},weightMap[lname + ".bias"]);
+    auto linear1_add = network->addElementWise(
+        *linear1_mul->getOutput(0),
+        *linear1_bias->getOutput(0),
+        ElementWiseOperation::kSUM
+    );
+    assert(linear1_add);   
 
     return linear1_add->getOutput(0);
 }
@@ -828,7 +862,7 @@ std::vector<ITensor*>  TransformerDecoder(
         out_shuffle1->setName((lname+".out_shuffle1."+std::to_string(i)).c_str());
         out_shuffle1->setFirstTranspose(Permutation{1, 0, 2 });
 
-        ITensor* reference_points_delta = ClsRegBranch(network,weightMap,
+        ITensor* reference_points_delta = RegBranch(network,weightMap,
                                             "bbox_head.reg_branches."+std::to_string(i),
                                             *out_shuffle1->getOutput(0),256,4);
 
@@ -922,7 +956,7 @@ std::vector<ITensor*>  GenEncoderOutputProposals(
 
     }
 
-    float *reference_points = reinterpret_cast<float*>(malloc(sizeof(float) * reference_points_size * 2));// hxw+hxw+hxw,4
+    float *reference_points = reinterpret_cast<float*>(malloc(sizeof(float) * reference_points_size * 4));// hxw+hxw+hxw,4
 
     for(int i=0;i<spatial_shapes.size();++i){
         auto spatial_shape = spatial_shapes[i];    
@@ -1043,7 +1077,7 @@ std::vector<ITensor*>  Transformer(
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
     std::vector<ITensor*>  mlvl_feats, // b,c,h,w
-    std::vector<ITensor*>  mlvl_pos_embeds, // 1,hw,c
+    std::vector<ITensor*>  mlvl_pos_embeds, // hw,1,c
     int num_level=4,
     int num_query=300,
     int embed_dim=256,
@@ -1130,19 +1164,32 @@ std::vector<ITensor*>  Transformer(
 
     output_memory_and_proposal = GenEncoderOutputProposals(network,weightMap,lname,*memory_shuffle->getOutput(0),spatial_shapes_vector,embed_dim);
 
-    ITensor* enc_outputs_class = ClsRegBranch(network,weightMap,"bbox_head.cls_branches.6",*output_memory_and_proposal[0],embed_dim,num_classes);
+    auto output_memory_size = output_memory_and_proposal[0]->getDimensions();
+    auto output_proposal_size = output_memory_and_proposal[1]->getDimensions();
 
-    ITensor* enc_outputs_coord_unact_delta = ClsRegBranch(network,weightMap,"bbox_head.reg_branches.6",*output_memory_and_proposal[0],embed_dim,4);
+    ITensor* enc_outputs_class = ClsBranch(network,weightMap,"bbox_head.cls_branches.6",*output_memory_and_proposal[0],embed_dim,num_classes);
+
+    auto enc_outputs_class_size = enc_outputs_class->getDimensions();
+
+    ITensor* enc_outputs_coord_unact_delta = RegBranch(network,weightMap,"bbox_head.reg_branches.6",*output_memory_and_proposal[0],embed_dim,4);
     
+    auto enc_outputs_coord_unact_delta_size = enc_outputs_coord_unact_delta->getDimensions();
+
     auto enc_outputs_coord_unact = network->addElementWise(*output_memory_and_proposal[1],
                                                             *enc_outputs_coord_unact_delta,
                                                             ElementWiseOperation::kSUM);
     
     auto enc_outputs_class_one = network->addSlice(*enc_outputs_class,Dims3{0,0,0},Dims3{batch_size,num_hw,1},Dims3{1,1,1});
 
+    auto enc_outputs_class_one_size = enc_outputs_class_one->getOutput(0)->getDimensions();
+
     auto topk_proposals = network->addTopK(*enc_outputs_class_one->getOutput(0),TopKOperation::kMAX,num_query,1); // bs,300,1
+
+    auto topk_proposals_size = topk_proposals->getOutput(0)->getDimensions();
     // TODO: 重点检查，可能出错
     auto topk_coords_unact = network->addGatherV2(*enc_outputs_coord_unact->getOutput(0),*topk_proposals->getOutput(1),GatherMode::kELEMENT); //// bs,300,4
+
+    auto topk_coords_unact_size = topk_coords_unact->getOutput(0)->getDimensions();
 
     auto decoder_reference_points = network->addActivation(*topk_coords_unact->getOutput(0),ActivationType::kSIGMOID);
 
@@ -1234,7 +1281,7 @@ std::vector<ITensor*> DeformableDetrHead(
     out_query_shuffle->setName((lname+".out_query_shuffle").c_str());
     out_query_shuffle->setFirstTranspose(Permutation{1,0,2}); // bs,300,256
 
-    ITensor* out_cls = ClsRegBranch(network,weightMap,"bbox_head.reg_branches.5",
+    ITensor* out_cls = ClsBranch(network,weightMap,"bbox_head.cls_branches.5",
                                     *out_query_shuffle->getOutput(0),
                                     embed_dim,num_classes);// bs,300,80
 
