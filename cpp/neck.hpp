@@ -43,11 +43,10 @@ ITensor* GroupNorm(
     group_shuffle->setName((lname+".group_shuffle").c_str());
     group_shuffle->setReshapeDimensions(Dims3{batch_size,num_group,H*W*channel/num_group});// bs,num_g,c
 
-
-    auto mean = network->addReduce(input, ReduceOperation::kAVG, 2, true);
+    auto mean = network->addReduce(*group_shuffle->getOutput(0), ReduceOperation::kAVG, 2, true);
     assert(mean); //bs,num_g,1
 
-    auto sub_mean = network->addElementWise(input, *mean->getOutput(0), ElementWiseOperation::kSUB);
+    auto sub_mean = network->addElementWise(*group_shuffle->getOutput(0), *mean->getOutput(0), ElementWiseOperation::kSUB);
     assert(sub_mean);//bs,num_g,1
 
     // implement pow2 with scale
@@ -70,15 +69,15 @@ ITensor* GroupNorm(
     auto div = network->addElementWise(*sub_mean->getOutput(0), *sqrt->getOutput(0), ElementWiseOperation::kDIV);
     assert(div);
 
-
     auto group_shuffle2 = network->addShuffle(*div->getOutput(0));
     group_shuffle2->setName((lname+".group_shuffle2").c_str());
     group_shuffle2->setReshapeDimensions(Dims4{batch_size,channel,H,W});// bs,c,h,w
 
     auto affine_weight = network->addConstant(Dims4{1,channel,1,1}, weightMap[lname + ".weight"]);
-    auto affine_multi = network->addElementWise(*div->getOutput(0),
+    auto affine_multi = network->addElementWise(*group_shuffle2->getOutput(0),
                                     *affine_weight->getOutput(0),
                                     ElementWiseOperation::kPROD);
+
     auto affine_bias = network->addConstant(Dims4{1,channel,1,1},weightMap[lname + ".bias"]);
     auto affine_add = network->addElementWise(*affine_multi->getOutput(0),
                                     *affine_bias->getOutput(0),
@@ -89,7 +88,7 @@ ITensor* GroupNorm(
 
 
 std::vector<ITensor*> ChannelMapper(
-    std::vector<ITensor*> inputs,
+    std::vector<ITensor* > &inputs,
     INetworkDefinition* network,
     std::unordered_map<std::string, Weights>& weightMap,
     const std::string& lname,
@@ -129,8 +128,8 @@ std::vector<ITensor*> ChannelMapper(
         weightMap[lname + ".convs.2.conv.weight"],
         Weights{});
     assert(conv3);
-    conv1->setStrideNd(DimsHW{ 1, 1 });
-    conv1->setPaddingNd(DimsHW{ 0, 0 });
+    conv3->setStrideNd(DimsHW{ 1, 1 });
+    conv3->setPaddingNd(DimsHW{ 0, 0 });
 
     ITensor* output3 = GroupNorm(network,weightMap,lname+".convs.2.gn",*conv3->getOutput(0),32);
 
@@ -142,8 +141,8 @@ std::vector<ITensor*> ChannelMapper(
         weightMap[lname + ".extra_convs.0.conv.weight"],
         Weights{});
     assert(conv3);
-    conv1->setStrideNd(DimsHW{ 2, 2 });
-    conv1->setPaddingNd(DimsHW{ 1, 1 });
+    conv4->setStrideNd(DimsHW{ 2, 2 });
+    conv4->setPaddingNd(DimsHW{ 1, 1 });
 
     ITensor* output4 = GroupNorm(network,weightMap,lname+".extra_convs.0.gn",*conv4->getOutput(0),32);    
 
