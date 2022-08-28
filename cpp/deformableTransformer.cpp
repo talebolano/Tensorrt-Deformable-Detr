@@ -1177,8 +1177,18 @@ std::vector<ITensor*>  Transformer(
     auto topk_proposals = network->addTopK(*enc_outputs_class_one->getOutput(0),TopKOperation::kMAX,num_query,1<<1); // bs,300,1
 
     // TODO: 重点检查，可能出错
-    auto topk_proposals_repeat = network->addSlice(*topk_proposals->getOutput(1),Dims3{0,0,0},Dims3{batch_size,num_query,4},Dims3{1,1,1});
-    auto topk_coords_unact = network->addGatherV2(*enc_outputs_coord_unact->getOutput(0),*topk_proposals_repeat->getOutput(0),GatherMode::kELEMENT); //// bs,300,4
+
+    int valid_ratios_ones[4] = {1,1,1,1};
+    auto valid_ratios = network->addConstant(Dims3{1,1,4},Weights{DataType::kINT32,&valid_ratios_ones,4});
+
+    auto topk_proposals_repeat = network->addElementWise(*topk_proposals->getOutput(1),
+                                                    *valid_ratios->getOutput(0),
+                                                    ElementWiseOperation::kPROD);
+
+    auto topk_coords_unact = network->addGatherV2(*enc_outputs_coord_unact->getOutput(0),
+                                                *topk_proposals_repeat->getOutput(0),
+                                                GatherMode::kELEMENT); //// bs,300,4
+    topk_coords_unact->setGatherAxis(1);
 
     auto decoder_reference_points = network->addActivation(*topk_coords_unact->getOutput(0),ActivationType::kSIGMOID);
 
@@ -1303,7 +1313,7 @@ const int input_W = 1333
     // backbone
     std::vector<ITensor*> mlvl_features = BuildResNet(network, weightMap, *data, R50, 64, 64, 256);
 
-    std::vector<ITensor*> mlvl_feat = ChannelMapper(mlvl_features,network, weightMap, "neck", 256);
+    std::vector<ITensor*> mlvl_feat = ChannelMapper(mlvl_features,network, weightMap, "neck", 256); //ok 对的
 
     std::vector<ITensor*> results = DeformableDetrHead(network, weightMap, "bbox_head",mlvl_feat,4,300,256,80);
 
@@ -1447,6 +1457,8 @@ int main(int argc, char** argv) {
     int input_h = context->getBindingDimensions(0).d[2];
     int input_w = context->getBindingDimensions(0).d[3];
 
+    auto cls_size = context->getBindingDimensions(1);
+    auto bbox_size = context->getBindingDimensions(2);
 
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
@@ -1471,8 +1483,8 @@ int main(int argc, char** argv) {
     std::vector<float> scores_h(BATCH_SIZE * NUM_QUERIES * NUM_CLASS);
     std::vector<float> boxes_h(BATCH_SIZE * NUM_QUERIES * 4);
 
-    std::vector<void*> buffers = { data_d, scores_d, boxes_d };
-    std::vector<float*> outputs = {scores_h.data(), boxes_h.data()};
+    std::vector<void*> buffers = { data_d, boxes_d, scores_d };
+    std::vector<float*> outputs = {boxes_h.data(),scores_h.data()};
 
     int fcount = 0;
     int fileLen = fileList.size();
