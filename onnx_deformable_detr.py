@@ -1,17 +1,17 @@
+import argparse
+from types import MethodType
+
 import onnx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.onnx.symbolic_helper import parse_args
-from torch.onnx import register_custom_op_symbolic
-from onnxsim import simplify
-from mmdet.apis import init_detector
-import argparse
-from mmdet.models.utils.transformer import inverse_sigmoid
 from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention
-from types import MethodType
+from mmdet.apis import init_detector
 from mmdet.core import multi_apply
-
+from mmdet.models.utils.transformer import inverse_sigmoid
+from onnxsim import simplify
+from torch.onnx import register_custom_op_symbolic
+from torch.onnx.symbolic_helper import parse_args
 
 class Etmpy_MultiScaleDeformableAttnFunction(torch.autograd.Function):
     @staticmethod
@@ -108,6 +108,121 @@ def MSMHDA_onnx_export(self,
     return self.dropout(output) + identity
 
 
+def multi_scale_deformable_attn_pytorch(value, value_spatial_shapes,
+                                        sampling_locations, attention_weights):
+    bs, _, num_heads, embed_dims = value.shape
+    _, num_queries, num_heads, num_levels, num_points, _ =\
+        sampling_locations.shape
+    value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes],
+                             dim=1)
+    sampling_grids = 2 * sampling_locations - 1
+    sampling_value_list = []
+    for level, (H_, W_) in enumerate(value_spatial_shapes):
+        # bs, H_*W_, num_heads, embed_dims ->
+        # bs, H_*W_, num_heads*embed_dims ->
+        # bs, num_heads*embed_dims, H_*W_ ->
+        # bs*num_heads, embed_dims, H_, W_
+        value_l_ = value_list[level].reshape(
+            int(bs),-1,int(num_heads*embed_dims)).transpose(1, 2).reshape(
+            int(bs * num_heads), int(embed_dims), int(H_), int(W_))
+        # bs, num_queries, num_heads, num_points, 2 ->
+        # bs, num_heads, num_queries, num_points, 2 ->
+        # bs*num_heads, num_queries, num_points, 2
+        sampling_grid_l_ = sampling_grids[:, :, :,
+                                          level:level+1].reshape(
+                                          int(bs),int(num_queries),int(num_heads),int(num_points),2).transpose(1, 2).reshape(
+                                          int(bs * num_heads),int(num_queries),int(num_points),2)
+        # bs*num_heads, embed_dims, num_queries, num_points
+        sampling_value_l_ = F.grid_sample(
+            value_l_,
+            sampling_grid_l_,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False)
+        sampling_value_list.append(sampling_value_l_)
+    # (bs, num_queries, num_heads, num_levels, num_points) ->
+    # (bs, num_heads, num_queries, num_levels, num_points) ->
+    # (bs* num_heads, 1, num_queries, num_levels*num_points)
+    attention_weights = attention_weights.transpose(1, 2).reshape(
+        int(bs * num_heads), 1, int(num_queries), int(num_levels * num_points))
+    output = (torch.stack(sampling_value_list, dim=-2).reshape(int(bs*num_heads),int(embed_dims),int(num_queries),-1) *
+              attention_weights).sum(-1).view(int(bs), int(num_heads * embed_dims),
+                                              int(num_queries))
+    return output.transpose(1, 2).contiguous()
+
+
+def MSMHDA_grid_sample_onnx_export(self,
+            query,
+            key=None,
+            value=None,
+            identity=None,
+            query_pos=None,
+            key_padding_mask=None,
+            reference_points=None,
+            spatial_shapes=None,
+            level_start_index=None,
+            **kwargs):
+
+    if value is None:
+        value = query
+
+    if identity is None:
+        identity = query
+    if query_pos is not None:
+        query = query + query_pos
+    if not self.batch_first:
+        # change to (bs, num_query ,embed_dims)
+        query = query.permute(1, 0, 2)
+        value = value.permute(1, 0, 2)
+
+    bs, num_query, _ = query.shape
+    bs, num_value, _ = value.shape
+    assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
+
+    value = self.value_proj(value)
+    if key_padding_mask is not None:
+        value = value.masked_fill(key_padding_mask[..., None], 0.0)
+    value = value.view(int(bs), int(num_value), self.num_heads, -1)
+    sampling_offsets = self.sampling_offsets(query).view(
+        int(bs), int(num_query), self.num_heads, self.num_levels, self.num_points, 2)
+    attention_weights = self.attention_weights(query).view(
+        int(bs), int(num_query), self.num_heads, self.num_levels * self.num_points)
+    attention_weights = attention_weights.softmax(-1)
+
+    attention_weights = attention_weights.view(int(bs), int(num_query),
+                                                self.num_heads,
+                                                self.num_levels,
+                                                self.num_points)
+    if reference_points.shape[-1] == 2:
+        offset_normalizer = torch.stack(
+            [spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+        sampling_locations = reference_points[:, :, None, :, None, :] \
+            + sampling_offsets \
+            / offset_normalizer[None, None, None, :, None, :]
+    elif reference_points.shape[-1] == 4:
+        sampling_locations = reference_points[:, :, None, :, None, :2] \
+            + sampling_offsets / self.num_points \
+            * reference_points[:, :, None, :, None, 2:] \
+            * 0.5
+    else:
+        raise ValueError(
+            f'Last dim of reference_points must be'
+            f' 2 or 4, but get {reference_points.shape[-1]} instead.')
+
+    output = multi_scale_deformable_attn_pytorch(
+        value, spatial_shapes, sampling_locations,
+        attention_weights)
+
+    output = self.output_proj(output)
+    output = output.reshape(int(bs),int(num_query),self.embed_dims)
+
+    if not self.batch_first:
+        # (num_query, bs ,embed_dims)
+        output = output.permute(1, 0, 2)
+
+    return self.dropout(output) + identity
+
+
 @parse_args('v','v','i','i','b')
 def grid_sampler(g, input, grid, mode_enum, padding_mode_enum, align_corners):
     mode_str = ['bilinear', 'nearest', 'bicubic'][mode_enum]
@@ -119,14 +234,14 @@ def deformable_detr_head_onnx_export(self, mlvl_feats):
 
     batch_size = mlvl_feats[0].size(0)
     img_masks = mlvl_feats[0].new_zeros(
-        (batch_size, mlvl_feats[0].size(2), mlvl_feats[0].size(3)))
+        (int(batch_size), int(mlvl_feats[0].size(2)), int(mlvl_feats[0].size(3))))
 
     mlvl_masks = []
     mlvl_positional_encodings = []
     for feat in mlvl_feats:
         mlvl_masks.append(
             F.interpolate(img_masks[None],
-                            size=feat.shape[-2:]).to(torch.bool).squeeze(0))
+                            size=( int(feat.size(2)), int(feat.size(3)))).to(torch.bool).squeeze(0))
         mlvl_positional_encodings.append(
             self.positional_encoding(mlvl_masks[-1]))
 
@@ -146,6 +261,12 @@ def deformable_detr_head_onnx_export(self, mlvl_feats):
     lvl = 5
     outputs_class = self.cls_branches[lvl](hs)
 
+    if inter_references.shape[-1] == 2:
+        tmp = self.reg_branches[lvl](hs)
+        if self.with_box_refine:
+            inter_references = torch.cat([inter_references,tmp[:,:,2:]],dim=-1)    
+        else:
+            inter_references = tmp
     return outputs_class, inter_references
 
 
@@ -217,7 +338,7 @@ def deformable_detr_transformer_onnx_export(self,
         bs, c, h, w = feat.shape
         spatial_shape = (h, w)
         spatial_shapes.append(spatial_shape)
-        feat = feat.flatten(2).transpose(1, 2) # b,c,hw --> b,hw,c
+        feat = feat.reshape(int(bs),int(c),int(h*w)).transpose(1, 2) # b,c,hw --> b,hw,c
         mask = mask.flatten(1)
         pos_embed = pos_embed.flatten(2).transpose(1, 2)
         lvl_pos_embed = pos_embed + self.level_embeds[lvl].view(1, 1, -1)
@@ -281,8 +402,8 @@ def deformable_detr_transformer_onnx_export(self,
         query_pos, query = torch.split(pos_trans_out, c, dim=2)
     else:
         query_pos, query = torch.split(query_embed, c, dim=1)
-        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
-        query = query.unsqueeze(0).expand(bs, -1, -1)
+        query_pos = query_pos.unsqueeze(0).expand(int(bs), -1, -1)
+        query = query.unsqueeze(0).expand(int(bs), -1, -1)
         reference_points = self.reference_points(query_pos).sigmoid()
         init_reference_out = reference_points
 
@@ -368,6 +489,7 @@ def parse():
     opt = argparse.ArgumentParser()
     opt.add_argument("--h",type=int)
     opt.add_argument("--w",type=int)
+    opt.add_argument("--usegridsample",action="store_true")
     opt.add_argument("--config",type=str)
     opt.add_argument("--checkpoint",type=str)
     opt.add_argument("--output",type=str)
@@ -378,14 +500,20 @@ if __name__=="__main__":
     opt = parse()
 
     opsetversion=11
-    register_custom_op_symbolic("::grid_sampler", grid_sampler, opsetversion)
+    if opt.usegridsample:
+        register_custom_op_symbolic("::grid_sampler", grid_sampler, opsetversion)
 
     model = init_detector(opt.config,
                         opt.checkpoint,
                         device='cpu')
-    for moudle in model.modules():
-        if isinstance(moudle,MultiScaleDeformableAttention):
-            moudle.forward = MethodType(MSMHDA_onnx_export,moudle)
+    if opt.usegridsample:
+        for moudle in model.modules():
+            if isinstance(moudle,MultiScaleDeformableAttention):
+                moudle.forward = MethodType(MSMHDA_grid_sample_onnx_export,moudle)
+    else:
+        for moudle in model.modules():
+            if isinstance(moudle,MultiScaleDeformableAttention):
+                moudle.forward = MethodType(MSMHDA_onnx_export,moudle)
 
     model.eval()
     model.forward = model.onnx_export
