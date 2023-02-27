@@ -14,7 +14,7 @@ TensorRT for Deformable Detr(use python)
 
 ### 1. Convert deformable detr model form pytorch to onnx
 
-    python3 onnx_deformable_detr.py --config ${mmdet_path}/configs/deformable_detr/deformable-detr_twostage_refine_r50_16x2_50e_coco.py --checkpoint ${mmdet_path}/work_dirs/deformable_detr_twostage_refine_r50_16x2_50e_coco_20210419_220613-9d28ab72.pth --output deformable_detr.onnx --h 750 --w 1333
+    python3 onnx_deformable_detr.py --config ${mmdet_path}/configs/deformable_detr/deformable_detr_twostage_refine_r50_16x2_50e_coco.py --checkpoint ${mmdet_path}/work_dirs/deformable_detr_twostage_refine_r50_16x2_50e_coco_20210419_220613-9d28ab72.pth --output deformable_detr.onnx --h 750 --w 1333
 
 ### 2.Genrate TensorRT engine
 

@@ -1,12 +1,12 @@
+import argparse
+import ctypes
+
+import cv2
 import numpy as np
-from torchvision.transforms import Normalize
+import tensorrt as trt
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import cv2
-import ctypes
-import tensorrt as trt
-import argparse
+from torchvision.transforms import Normalize
 
 
 CLASSES = ["person", "bicycle", "car", "motorcycle", "airplane", "bus",

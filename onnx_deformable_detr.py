@@ -3,7 +3,6 @@ from types import MethodType
 
 import onnx
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.ops.multi_scale_deform_attn import MultiScaleDeformableAttention
 from mmdet.apis import init_detector
@@ -12,6 +11,7 @@ from mmdet.models.utils.transformer import inverse_sigmoid
 from onnxsim import simplify
 from torch.onnx import register_custom_op_symbolic
 from torch.onnx.symbolic_helper import parse_args
+
 
 class Etmpy_MultiScaleDeformableAttnFunction(torch.autograd.Function):
     @staticmethod
@@ -528,7 +528,6 @@ if __name__=="__main__":
 
     torch.onnx.export(model,x,opt.output,verbose=True,
                 output_names=["cls","bbox"],
-                enable_onnx_checker=False,
                 operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
                 opset_version=opsetversion,
                 # custom_opsets={"MultiscaleDeformableAttnPlugin_TRT":1},
